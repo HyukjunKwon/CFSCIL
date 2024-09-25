@@ -29,6 +29,19 @@ class FEwHD(nn.Module):
         hv_features = self.fc(features)
         return hv_features
 
+def orthogonality_loss(fc_weights, epsilon=1e-5):
+    # Normalize the weight vectors (class hypervectors)
+    fc_weights_normalized = F.normalize(fc_weights, p=2, dim=1)  # Normalize along the feature dimension
+
+    # Compute the dot product between all pairs of weight vectors
+    dot_products = torch.matmul(fc_weights_normalized, fc_weights_normalized.T)
+
+    # Subtract identity matrix to ensure only off-diagonal terms are considered (to avoid self dot products)
+    identity_matrix = torch.eye(dot_products.size(0)).to(fc_weights.device)
+    orth_loss = torch.sum(torch.abs(dot_products - identity_matrix))
+
+    return orth_loss
+
 #Class memory
 
 class CFSCILMemory:
@@ -71,39 +84,55 @@ def get_cifar100_loaders(batch_size=64):
 
     return train_loader, test_loader
 
-
-# Training loop with CFSCILMemory
-def train(model, memory, optimizer, loss_fn, train_loader, num_epochs=10):
+def train(model, memory, optimizer, train_loader, num_epochs=10, orth_weight=0.001):
     model.train()
 
     for epoch in range(num_epochs):
         correct, total = 0, 0
-        total_loss = 0
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
 
         for data, labels in progress_bar:
             optimizer.zero_grad()
 
+            # Move data and labels to the correct device
             data, labels = data.to(device), labels.to(device)
-            
+
             # Extract hyperdimensional features from the data
             features = model(data)
-            
-            # After forward pass, update memory with nudging
+
+            # Update memory with nudging for each class in the batch
             for class_id in torch.unique(labels):
                 class_features = features[labels == class_id]
                 memory.update_memory_with_nudging(class_id.item(), class_features)
 
-            # Classification for training accuracy (using memory-based classification)
-            predictions = [memory.classify(feature) for feature in features]
-            correct += (torch.tensor(predictions).to(device) == labels).sum().item()
-            total += labels.size(0)
+            # Orthogonality loss on the FC layer weights
+            orth_loss = orthogonality_loss(model.fc.weight)
 
-            # Update tqdm progress bar with accuracy and loss (optional loss tracking)
-            progress_bar.set_postfix(accuracy=f"{(correct/total) * 100:.2f}%")
+            # Combine orthogonality loss and classification loss if memory is not empty
+            if memory.memory:
+                predictions = [memory.classify(feature) for feature in features]
+                correct += (torch.tensor(predictions).to(device) == labels).sum().item()
+                total += labels.size(0)
 
-        # Print accuracy for the current epoch
-        print(f"Epoch {epoch+1}/{num_epochs}, Training Accuracy: {(correct/total) * 100:.2f}%")
+                # Compute combined loss
+                total_loss = orth_weight * orth_loss  # Optionally add classification loss if using one
+                total_loss.backward()
+
+                # Update tqdm progress bar with accuracy
+                progress_bar.set_postfix(accuracy=f"{(correct/total) * 100:.2f}%")
+            else:
+                # Skip classification accuracy computation if memory is empty
+                progress_bar.set_postfix(accuracy="N/A (Memory empty)")
+
+            # Backpropagate and update weights
+            optimizer.step()
+
+        # Print accuracy and orthogonality loss for the current epoch if applicable
+        if total > 0:
+            print(f"Epoch {epoch+1}/{num_epochs}, Training Accuracy: {(correct/total) * 100:.2f}%")
+        else:
+            print(f"Epoch {epoch+1}/{num_epochs}, No classification yet (Memory still empty)")
+
 
 # Evaluation loop with CFSCILMemory
 def evaluate(model, memory, test_loader):
@@ -135,13 +164,12 @@ def main():
     train_loader, test_loader = get_cifar100_loaders(batch_size=64)
 
     # Initialize the model, memory, optimizer, and loss function
-    model = FEwHD(feature_dim=512, hv_dim=3000).to(device)
+    model = FEwHD(feature_dim=512, hv_dim=512).to(device)
     memory = CFSCILMemory()
     optimizer = torch.optim.Adam(model.fc.parameters(), lr=0.001)
-    loss_fn = nn.CrossEntropyLoss() 
-
+    
     # Train the model
-    train(model, memory, optimizer, loss_fn, train_loader, num_epochs=50)
+    train(model, memory, optimizer, train_loader, num_epochs=1)
 
     # Evaluate the model
     evaluate(model, memory, test_loader)
